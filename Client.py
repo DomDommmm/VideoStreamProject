@@ -8,53 +8,49 @@ from collections import deque
 from RtpPacket import RtpPacket
 
 # Jitter buffer configuration
-PREBUFFER_MIN = 10            # Minimum frames to accumulate before starting playback
-PREBUFFER_TIMEOUT = 2.0       # Max seconds to wait for prebuffer
+PREBUFFER_MIN = 50            # Minimum frames to accumulate before starting playback
+PREBUFFER_TIMEOUT = 3.0       # Max seconds to wait for prebuffer
 TARGET_FPS = 30.0             # Desired playback framerate
-MAX_BUFFER = 120              # Cap buffer length (avoid memory growth)
-STALL_MODE = "wait"           # "wait" or "drop" when buffer underflows
-MAX_FRAME_BYTES = 2_000_000   # Safety cap per frame size
-
-SOI = b"\xff\xd8"
-EOI = b"\xff\xd9"
+MAX_BUFFER = 450              # Cap buffer length (avoid memory growth)
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
 
 class FrameBuffer:
 	def __init__(self, maxlen):
-		self._dq = deque()
-		self._lock = threading.Lock()
-		self._maxlen = maxlen
+		self.dq = deque()
+		self.lock = threading.Lock()
+		self.maxlen = maxlen
 		self.dropped_overflow = 0
 
 	def push(self, frame_bytes):
-		with self._lock:
-			if len(self._dq) >= self._maxlen:
+		with self.lock:
+			if len(self.dq) >= self.maxlen:
 				# Drop newest to keep continuity (alternatively popleft to drop oldest)
 				self.dropped_overflow += 1
+				self.dq.popleft()
 				return False
-			self._dq.append(frame_bytes)
+			self.dq.append(frame_bytes)
 			return True
 		
 	def pop(self):
-		with self._lock:
-			if self._dq:
-				return self._dq.popleft()
+		with self.lock:
+			if self.dq:
+				return self.dq.popleft()
 			return None
 	
 	def size(self):
-		with self._lock:
-			return len(self._dq)
+		with self.lock:
+			return len(self.dq)
 	
 	def clear(self):
-		with self._lock:
-			self._dq.clear()
+		with self.lock:
+			self.dq.clear()
 	
 	def stats(self):
-		with self._lock:
+		with self.lock:
 			return {
-				"size": len(self._dq),
+				"size": len(self.dq),
 				"dropped_overflow": self.dropped_overflow
 			}
 
@@ -68,12 +64,12 @@ class Client:
 	PLAY = 1
 	PAUSE = 2
 	TEARDOWN = 3
+	RESOLUTION = 4
 	
 	# Initiation..
 	def __init__(self, master, serveraddr, serverport, rtpport, filename):
 		self.master = master
 		self.master.protocol("WM_DELETE_WINDOW", self.handler)
-		self.createWidgets()
 		self.serverAddr = serveraddr
 		self.serverPort = int(serverport)
 		self.rtpPort = int(rtpport)
@@ -85,17 +81,72 @@ class Client:
 		self.connectToServer()
 		self.frameNbr = 0
 		self.frameBuffer = bytearray()
-		self.lastSeq = None
-		self.seqnum = 0 # RTP sequ
+		self.playEvent = threading.Event()
+		# Resolution control presets must be initialized before widgets
+		self.res_presets = {
+			"Original": None,
+			"144p": 144,
+			"240p": 240,
+			"360p": 360,
+			"480p": 480,
+			"720p": 720,
+			"1080p": 1080
+		}
+		self.target_height = None
+		self.res_var = None
+		self.last_frame_size = None
+		self.base_display_size = None # (w, h) window-fit set on first frame
+		self.createWidgets()
+		self.seqnum = 0 # RTP seq
 		self._rtspClosing = False
-		# JPEG markers for basic integrity checks
-		self._SOI = b"\xff\xd8"
-		self._EOI = b"\xff\xd9"
-		self._MAX_FRAME_BYTES = 2 * 1024 * 1024  # 2MB safety cap
+		# JPEG markers for basic integrity checks (instance-level, Option B)
+		self.SOI = b"\xff\xd8"
+		self.EOI = b"\xff\xd9"
+		self.MAX_FRAME_BYTES = 2 * 1024 * 1024  # 2MB safety cap
 		
 		self.buffer = FrameBuffer(MAX_BUFFER)
 		self.playbackThread = None
 		self.stopPlayback = threading.Event()
+
+		self.paused = False
+		self.resync = False
+
+		self.resume_until = 0.0      # time.monotonic() deadline to ignore non-SOI
+		self.resume_grace_ms = 200   # milliseconds to ignore non-SOI packets
+
+		self.assembled_count = 0
+		self.displayed_count = 0
+
+		self.FEC_GROUP_SIZE = 10
+		self.RTP_PT_MJPEG = 26
+		self.RTP_PT_FEC = 127
+
+		self.fec_blocks = {}
+		# self.fec_next_block_id = 0
+		# self.fec_next_index = 0
+		# Grace wait (ms) before recovering the last packet in a block
+		# Helps avoid false recoveries when parity arrives before data due to UDP reordering
+		self.fec_last_wait_ms = 18
+
+	@staticmethod
+	def fecParseHeader(buf):
+		"""Return (block_id, group_size, fec_len)"""
+		if len(buf) < 8:
+			return (None, None, None)
+		block_id = int.from_bytes(buf[0:4], 'big')
+		group_size = int.from_bytes(buf[4:6], 'big')
+		fec_len = int.from_bytes(buf[6:8], 'big')
+		return (block_id, group_size, fec_len)
+
+	@staticmethod
+	def _xor_bytes(a, b):
+		"""XOR two byte strings, padding shorter one with zeros"""
+		L = max(len(a), len(b))
+		if len(a) < L:
+			a = a + b'\x00' * (L - len(a))
+		if len(b) < L:
+			b = b + b'\x00' * (L - len(b))
+		return bytes(x ^ y for x, y in zip(a, b))
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -106,30 +157,34 @@ class Client:
 		self.setup.grid(row=1, column=0, padx=2, pady=2)
 		
 		# Create Play button		
-		self.start = Button(self.master, width=20, padx=3, pady=3)
-		self.start["text"] = "Play"
-		self.start["command"] = self.playMovie
+		self.start = Button(self.master, width=20, padx=3, pady=3, text="Play", command=self.playMovie)
 		self.start.grid(row=1, column=1, padx=2, pady=2)
-		
-		# Create Pause button			
-		self.pause = Button(self.master, width=20, padx=3, pady=3)
-		self.pause["text"] = "Pause"
-		self.pause["command"] = self.pauseMovie
-		self.pause.grid(row=1, column=2, padx=2, pady=2)
-		
-		# Create Teardown button
-		self.teardown = Button(self.master, width=20, padx=3, pady=3)
-		self.teardown["text"] = "Teardown"
-		self.teardown["command"] = self.exitClient
-		self.teardown.grid(row=1, column=3, padx=2, pady=2)
-		
-		# Create a label to display the movie
-		self.label = Label(self.master)
-		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5)
 
-		# Make grid responsive
+		# Resolution selector between Play and Pause
+		self.res_var = StringVar(self.master)
+		self.res_var.set("Original")  # default
+		_res_labels = list(self.res_presets.keys())
+
+		# Create OptionMenu with command callback
+		self.res_select = OptionMenu(self.master, self.res_var, *_res_labels, command=self.onResolutionSelected)
+		self.res_select.configure(width=16)
+		self.res_select.grid(row=1, column=2, padx=2, pady=2)
+
+		# Create Pause button
+		self.pause = Button(self.master, width=20, padx=3, pady=3, text="Pause", command=self.pauseMovie)
+		self.pause.grid(row=1, column=3, padx=2, pady=2)
+
+		# Create Teardown button
+		self.teardown = Button(self.master, width=20, padx=3, pady=3, text="Teardown", command=self.exitClient)
+		self.teardown.grid(row=1, column=4, padx=2, pady=2)
+
+		# Label spans 5 columns now
+		self.label = Label(self.master)
+		self.label.grid(row=0, column=0, columnspan=5, sticky=W+E+N+S, padx=5, pady=5)
+
+		# Make grid responsive for 5 columns
 		try:
-			for c in range(4):
+			for c in range(5):
 				self.master.columnconfigure(c, weight=1)
 			self.master.rowconfigure(0, weight=1)
 		except Exception:
@@ -191,6 +246,16 @@ class Client:
 		except SystemExit:
 			pass
 
+	def showLoading(self, on=True):
+		"""Toggle a simple loading overlay when waiting for frame."""
+		try:
+			if on:
+				self.label.configure(text="Loading...", compound="center")
+			else:
+				self.label.configure(text="", compound=None)
+		except Exception:
+			pass
+
 	def handler(self):
 		"""Immediate quit on window close."""
 		self.exitClient()
@@ -204,6 +269,9 @@ class Client:
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
 			self.sendRtspRequest(self.PAUSE)
+			self.playEvent.set()
+			self.stopPlayback.set()
+			self.paused = True
 	
 	def playMovie(self):
 		"""Play button handler."""
@@ -211,110 +279,252 @@ class Client:
 			# Create a new thread to listen for RTP packets
 			self.frameBuffer = bytearray()
 			self.lastSeq = None
-			self.buffer.clear()
 			self.stopPlayback.clear()
 
-			threading.Thread(target=self.listenRtp, daemon=True).start()
-			self.playEvent = threading.Event()
 			self.playEvent.clear()
+			threading.Thread(target=self.listenRtp, daemon=True).start()
 
 			# Send PLAY RTSP
 			self.sendRtspRequest(self.PLAY)
 			
 			self.playbackThread = threading.Thread(target=self.displayLoop, daemon=True)
 			self.playbackThread.start()
+
+	def onResolutionSelected(self, label):
+		"""
+		Handle selection from the resolution dropdown;
+		send RESOLUTION RTSP.
+		"""
+		height = self.res_presets.get(label, None)
+		self.target_height = height
+		
+		# Only send if we have a valid RTSP session ID (After SETUP)
+		if self.sessionId == 0:
+			print(f"[Client] Resolution set locally to {label}")
+			return
+		
+		self.rtspSeq += 1
+		desired = 0 if height is None else int(height)
+		request = (
+			f"RESOLUTION {self.fileName} RTSP/1.0\n"
+			f"CSeq: {self.rtspSeq}\n"
+			f"Session: {self.sessionId}\n"
+			f"X-Resolution: {desired}\n\n"
+		)
+		try:
+			self.rtspSocket.send(request.encode())
+			print(f"[Client] Requested resolution change to {label} ({desired or 'Original'}). CSeq={self.rtspSeq}")
+			self.requestSent = getattr(self, 'RESOLUTION', 4)
+		except Exception as e:
+			print(f"[Client] Failed to send RESOLUTION: {e}")
 	
 	def listenRtp(self):		
-		"""Listen for RTP packets."""
+		"""Receive RTP packets, reassemble frames, and push completed frames into jitter buffer."""
 		timeouts = 0
+		partial = bytearray()
+		lastSeq = None
+
 		while True:
 			try:
 				data = self.rtpSocket.recv(20480)
-				if data:
-					timeouts = 0
-					rtpPacket = RtpPacket()
-					rtpPacket.decode(data)
+				if not data:
+					continue
+				timeouts = 0
+				rtpPacket = RtpPacket()
+				rtpPacket.decode(data)
 
-					seq = rtpPacket.seqNum()
-					# Marker bit: top bit of header[1]
-					marker = rtpPacket.marker()
-					payload = rtpPacket.getPayload()
+				pt = rtpPacket.payloadType()
+				seq = rtpPacket.seqNum()
+				marker = rtpPacket.marker()
+				payload = rtpPacket.getPayload()
 
-					# Gap detection: if a fragment is missing, drop the partial frame and resync
-					if self.lastSeq is not None and seq != self.lastSeq + 1:
-						print(f"Gap detected: lastSeq={self.lastSeq}, currentSeq={seq}. Dropping partial frame.")
-						self.frameBuffer.clear()
-						self.lastSeq = None
-
-					# If we are not currently collecting a frame, only start when the chunk begins with JPEG SOI
-					if len(self.frameBuffer) == 0 and not payload.startswith(self._SOI):
-						# Not a frame start; skip until we find SOI to resync
-						self.lastSeq = seq
+				if pt == self.RTP_PT_FEC:
+					fec_payload = rtpPacket.getPayload()
+					hdr = self.fecParseHeader(fec_payload[:8])
+					if not hdr:
 						continue
-				
-					# Append chunk
-					self.frameBuffer.extend(payload)
-					self.lastSeq = seq
-
-					# Safety cap: if the frame grows too large, drop it to avoid runaway memory
-					if len(self.frameBuffer) > self._MAX_FRAME_BYTES:
-						print(f"[Client] Frame exceeded {self._MAX_FRAME_BYTES} bytes. Dropping.")
-						self.frameBuffer.clear()
-						self.lastSeq = None
-						continue
-
-					# If marker == 1, we're reached the end of this frame
-					if marker == 1:
-						# Validate basic JPEG integrity (SOI/EOI)
-						if not (len(self.frameBuffer) >= 4 and self.frameBuffer.startswith(self._SOI) and self.frameBuffer.endswith(self._EOI)):
-							print(f"[Client] Discarding incomplete frame (size={len(self.frameBuffer)}). Missing SOI/EOI.")
-							self.frameBuffer.clear()
-							self.lastSeq = None
-							continue
-						try:
-							print(f"[Client] Assembled frame of {len(self.frameBuffer)} bytes (last seq={seq})")
-							imageFile = self.writeFrame(bytes(self.frameBuffer))
-							self.updateMovie(imageFile)
-						except Exception as pe:
-							print(f"[Client] Failed to display frame: {pe}")
-						finally:
-							self.frameBuffer.clear()
-							self.lastSeq = None
+					block_id, group_size, fec_len = hdr
+					parity = fec_payload[8:8 + fec_len]
 					
-					# currFrameNbr = rtpPacket.seqNum()
-					# # Basic drop detection
-					# if currFrameNbr > self.frameNbr + 1:
-					# 	print(f"Warning: dropped {currFrameNbr - self.frameNbr - 1} frame(s) between {self.frameNbr} -> {currFrameNbr}")
-					# print("Current Seq Num: " + str(currFrameNbr))
-										
-					# if currFrameNbr > self.frameNbr: # Discard the late packet
-					# 	self.frameNbr = currFrameNbr
-					# 	self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+					block = self.fecGetBlock(block_id)
+					# Validate or set group size
+					if block['group_size'] is None:
+						block['group_size'] = group_size
+					elif block['group_size'] != group_size:
+						block['chunks'].clear()
+						block['recovered_idx'] = None
+						block['recovered_at'] = None
+						block['group_size'] = group_size
+					block['parity'] = parity
+					rec = self.fecRecoverPacket(block_id)
+					if rec:
+						missing_idx, recovered_chunk = rec
+						block['chunks'].append((missing_idx, recovered_chunk))
+						self.pushDataFragment(recovered_chunk, marker)
+				
+				if pt == self.RTP_PT_MJPEG:
+					if len(payload) < 8:
+						chunk = payload
+						self.pushDataFragment(chunk, marker)
+						continue
+
+					block_id = int.from_bytes(payload[0:4], 'big')
+					index = int.from_bytes(payload[4:6], 'big')
+					group_size = int.from_bytes(payload[6:8], 'big')
+					chunk = payload[8:]
+
+					block = self.fecGetBlock(block_id)
+					if block['group_size'] is None:
+						block['group_size'] = group_size
+					if block['group_size'] != group_size:
+						block['chunks'].clear()
+						block['parity'] = None
+						block['group_size'] = group_size
+						block['recovered_idx'] = None
+						block['recovered_at'] = None
+
+
+					if block['recovered_idx'] is not None and block['recovered_idx'] == index:
+						continue
+
+					block['chunks'] = [(i, c) for (i, c) in block['chunks'] if i != index]
+					block['chunks'].append((index, chunk))
+
+					self.pushDataFragment(chunk, marker)
+					
+
+			# 	# Sequence gap handling
+			# 	if lastSeq is not None and seq != lastSeq + 1:
+			# 		# Drop partial frame
+			# 		partial.clear()
+			# 		lastSeq = None
+
+			# 	# If paused, flush any in-flight assembly and wait
+			# 	if self.paused:
+			# 		partial.clear()
+			# 		lastSeq = None
+			# 		self.paused = False
+
+			# 	# Resync after resume: ignore non-SOI until grace deadline or first clean SOI
+			# 	if len(partial) == 0:
+			# 		now = time.monotonic()
+			# 		if self.resync:
+			# 			if now <= self.resume_until:
+			# 				if not payload.startswith(self.SOI):
+			# 					lastSeq = None
+			# 					continue
+			# 			else:
+			# 				if not payload.startswith(self.SOI):
+			# 					lastSeq = None
+			# 					continue
+			# 		# First clean SOI found after resume
+			# 		self.resync = False
+
+			# 	partial.extend(payload)
+			# 	lastSeq = seq
+
+			# 	# Safety cap
+			# 	if len(partial) > self.MAX_FRAME_BYTES:
+			# 		print(f"[Client] Oversized frame ({len(partial)} bytes) dropped.")
+			# 		partial.clear()
+			# 		lastSeq = None
+			# 		continue
+
+			# 	if marker == 1:
+			# 		# Validate SOI/EOI
+			# 		if not (partial.startswith(self.SOI) and partial.endswith(self.EOI)):
+			# 			print(f"[Client] Incomplete JPEG dropped size={len(partial)} seq={seq}")
+			# 			partial.clear()
+			# 			lastSeq = None
+			# 			continue
+
+			# 		size_before_clear = len(partial)
+			# 		pushed = self.buffer.push(bytes(partial))
+			# 		if pushed:
+			# 			self.assembled_count += 1
+			# 			print(f"[Client] Receive frame #{self.assembled_count} buf={self.buffer.size()} size={size_before_clear}")
+			# 		else:
+			# 			print("[Client] Buffer full; frame dropped.")
+			# 		partial.clear()
+			# 		lastSeq = None
+
 			except socket.timeout:
-				# Timeout is expected; check control flags and continue or exit
 				if self.playEvent.isSet() or self.teardownAcked == 1:
 					break
 				timeouts += 1
 				if timeouts % 10 == 0:
-					print("[Client] No RTP packets received yet...")
+					print("[Client] Waiting for RTP...")
 				continue
 			except Exception as e:
-				# Stop listening upon requesting PAUSE or TEARDOWN
-				if self.playEvent.isSet(): 
+				if self.playEvent.isSet() or self.teardownAcked == 1:
 					break
-				
-				# Upon receiving ACK for TEARDOWN request,
-				# close the RTP socket
-				if self.teardownAcked == 1:
-					try:
-						self.rtpSocket.close()
-					except Exception:
-						pass
-					break
-				# Log unexpected errors to help diagnose remote issues
 				print(f"[Client] listenRtp error: {e}")
 				traceback.print_exc()
-					
+				continue
+
+	def pushDataFragment(self, payload, marker, seq=None):
+		"""Assemble JPEG from RTP fragments. seq=None for recovered fragments."""
+		try:
+			# # Sequence gap handling for real RTP packets
+			# if seq is not None and getattr(self, 'lastSeq', None) is not None and seq != self.lastSeq + 1:
+			# 	# Gap: drop current partial
+			# 	self.frameBuffer.clear()
+			# 	self.lastSeq = None
+
+			# Pause flush
+			if self.paused:
+				self.frameBuffer.clear()
+				self.paused = False
+
+			# Enforce SOI at frame start with resume grace
+			if len(self.frameBuffer) == 0:
+				if self.resync:
+					now = time.monotonic()
+					if now <= self.resume_until:
+						if not payload.startswith(self.SOI):
+							return
+					else:
+						if not payload.startswith(self.SOI):
+							return
+					self.resync = False
+				else:
+					if not payload.startswith(self.SOI):
+						return
+
+			# Append fragment
+			self.frameBuffer.extend(payload)
+			# if seq is not None:
+			# 	self.lastSeq = seq
+
+			# Safety cap
+			if len(self.frameBuffer) > self.MAX_FRAME_BYTES:
+				print(f"[Client] Oversized frame ({len(self.frameBuffer)} bytes) dropped.")
+				self.frameBuffer.clear()
+				# self.lastSeq = None
+				return
+
+			# End of frame
+			if marker == 1 or payload.endswith(self.EOI):
+				if not (self.frameBuffer.startswith(self.SOI) and self.frameBuffer.endswith(self.EOI)):
+					print(f"[Client] Incomplete JPEG dropped size={len(self.frameBuffer)}")
+					self.frameBuffer.clear()
+					self.lastSeq = None
+					return
+
+				size_before_clear = len(self.frameBuffer)
+				pushed = self.buffer.push(bytes(self.frameBuffer))
+				if pushed:
+					self.assembled_count += 1
+					print(f"[Client] Receive frame #{self.assembled_count} buf={self.buffer.size()} size={size_before_clear}")
+				else:
+					print("[Client] Buffer full; frame dropped.")
+				self.frameBuffer.clear()
+				# self.lastSeq = None
+		except Exception as e:
+			print(f"[Client] pushDataFragment error: {e}")
+			self.frameBuffer.clear()
+			# self.lastSeq = None
+
 	def writeFrame(self, data):
 		"""Write the received frame to a temp image file. Return the image file."""
 		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
@@ -325,19 +535,28 @@ class Client:
 		return cachename
 	
 	def updateMovie(self, imageFile):
-		"""Update the image file as video frame in the GUI."""
+		"""
+		Update GUI frame;
+		Upscale to the initial window size (zoom) if needed.
+		"""
 		img = Image.open(imageFile)
+		src_w, src_h = img.size
+		# Initialize baseline window frame size from first frame
+		if self.last_frame_size is None:
+			self.last_frame_size = (src_w, src_h)
+			# Set initial window geometry once:
+			try:
+				pad = 80
+				self.master.geometry(f"{max(src_w, 300)}x{src_h + pad}")
+			except Exception:
+				pass
+		target_w, target_h = self.last_frame_size
+		# Always scale incoming frames to target window size (zoom if smaller)
+		if (src_w, src_h) != (target_w, target_h):
+			img = img.resize((target_w, target_h), Image.BILINEAR)
 		photo = ImageTk.PhotoImage(img)
 		self.label.configure(image=photo)
-		self.label.image = photo
-		# Optionally resize the window to fit the video frame plus controls
-		try:
-			w, h = img.size
-			# Approximate controls height padding
-			pad = 80
-			self.master.geometry(f"{max(w, 300)}x{h + pad}")
-		except Exception:
-			pass
+		self.label.image=photo
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
@@ -470,16 +689,26 @@ class Client:
 					if self.requestSent == self.SETUP:
 						# Update RTSP state.
 						self.state = self.READY
+						# Reset stats for a fresh session
+						self.assembled_count = 0
+						self.displayed_count = 0
 				
 						# Open RTP port.
 						self.openRtpPort() 
 					elif self.requestSent == self.PLAY:
 						self.state = self.PLAYING
+						self.resync = True
+						now = time.monotonic()
+						self.resume_until = now + (self.resume_grace_ms / 1000.0)
 					elif self.requestSent == self.PAUSE:
 						self.state = self.READY
+						self.playEvent.set()
+						self.paused = True
 						
 						# The play thread exits. A new thread is created on resume.
 						self.playEvent.set()
+					elif self.requestSent == self.RESOLUTION:
+						print("[Client] Resolution change acknowledged by server.")
 					elif self.requestSent == self.TEARDOWN:
 						self.state = self.INIT
 						
@@ -488,9 +717,6 @@ class Client:
 	
 	def openRtpPort(self):
 		"""Open RTP socket binded to a specified port."""
-		#-------------
-		# TO COMPLETE
-		#-------------
 		# Create a new datagram socket to receive RTP packets from the server
 		self.rtpSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		# Increase receive buffer to reduce UDP drops
@@ -520,4 +746,107 @@ class Client:
 				pass
 			self.rtpSocket = None
 
-	# Removed duplicate handler below; the top-level handler attached in __init__ is used
+	# Removed duplicate handler below;
+
+	def displayLoop(self):
+		"""Consume frames from buffer at TARGET_FPS, starting only after prebuffer threshold."""
+		start_wait = time.monotonic()
+		# Wait for prebuffer or timeout
+		while self.buffer.size() < PREBUFFER_MIN:
+			if (time.monotonic() - start_wait) > PREBUFFER_TIMEOUT:
+				print("[Client] Prebuffer timeout; starting playback with fewer frames.")
+				break
+			if self.stopPlayback.is_set() or self.teardownAcked == 1:
+				self.showLoading(False)
+				return
+			time.sleep(0.01)
+		self.showLoading(False)
+
+		print(f"[Client] Playback starting. Initial buffered frames={self.buffer.size()}")
+
+		frame_interval = 1.0 / TARGET_FPS
+		now = time.monotonic()
+		next_display_time = time.monotonic()
+
+		displayed = 0
+		# dropped_empty = 0
+		# last_log = time.monotonic()
+
+		while not self.stopPlayback.is_set() and self.teardownAcked == 0:
+			now = time.monotonic()
+			frame_interval = 1.0 / TARGET_FPS
+			delay = next_display_time - now
+			if delay > 0:
+				time.sleep(delay)
+
+			frame = self.buffer.pop()
+			if frame is None:
+				self.showLoading(True)
+				while frame is None and not self.stopPlayback.is_set() and self.teardownAcked == 0:
+					frame = self.buffer.pop()
+					time.sleep(0.01)
+				self.showLoading(False)
+
+			if frame is None:
+				# Playback stopping or still empty after wait
+				continue
+
+			try:
+				imageFile = self.writeFrame(frame)
+				self.updateMovie(imageFile)
+				displayed += 1
+			except Exception as e:
+				print(f"[Client] display error: {e}")
+
+			next_display_time += frame_interval
+
+			self.displayed_count += 1
+			stats = self.buffer.stats()
+			print(f"[Client] Stats: displayed={self.displayed_count} buf={stats['size']} overflowDrops={stats['dropped_overflow']}")
+
+	def fecGetBlock(self, block_id):
+		block = self.fec_blocks.get(block_id)
+		if not block:
+			block = {
+				'chunks': [],
+				'group_size': None,
+				'parity': None,
+				'recovered_idx': None,
+				'recovered_at': None,
+			}
+			self.fec_blocks[block_id] = block
+		return block
+	
+	def fecRecoverPacket(self, block_id):
+		block = self.fec_blocks.get(block_id)
+		group = block.get('group_size')
+		parity = block.get('parity')
+		if not group or parity is None:
+			return None
+		
+		present = len(block['chunks'])
+		if present != group - 1:
+			return None
+	
+		have = [False] * group
+		for idx, _payload in block['chunks']:
+			if 0 <= idx < group:
+				have[idx] = True
+		try:
+			missing_idx = have.index(False)
+		except ValueError:
+			return None
+		
+		if missing_idx == group - 1 and self.fec_last_wait_ms > 0:
+			time.sleep(min(0.030, max(0.0, self.fec_last_wait_ms / 1000.0)))
+
+		rec = parity
+		for idx, payload in block['chunks']:
+			rec = self._xor_bytes(rec, payload)
+
+		block['recovered_idx'] = missing_idx
+		block['recovered_at'] = time.monotonic()
+		# Log successful recovery
+		present = len(block['chunks'])
+		print(f"[FEC] Recovered 1 missing packet in block {block_id} (group={group}, present={present}, len={len(rec)})")
+		return (missing_idx, rec)

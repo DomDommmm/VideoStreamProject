@@ -1,0 +1,9 @@
+movie.mjpeg
+movieFHD.mjpeg
+movieHD.mjpeg
+*.DS_Store
+.vscode/
+__pycache__/
+*.pyc
+.env
+.venv/

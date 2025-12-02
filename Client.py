@@ -117,7 +117,7 @@ class Client:
 		self.assembled_count = 0
 		self.displayed_count = 0
 
-		self.FEC_GROUP_SIZE = 10
+		# self.FEC_GROUP_SIZE = 10
 		self.RTP_PT_MJPEG = 26
 		self.RTP_PT_FEC = 127
 
@@ -356,13 +356,8 @@ class Client:
 						block['recovered_at'] = None
 						block['group_size'] = group_size
 					block['parity'] = parity
-					rec = self.fecRecoverPacket(block_id)
-					if rec:
-						missing_idx, recovered_chunk = rec
-						block['chunks'].append((missing_idx, recovered_chunk))
-						self.pushDataFragment(recovered_chunk, marker)
-				
-				if pt == self.RTP_PT_MJPEG:
+					self.fecFlushBlock(block_id)
+				elif pt == self.RTP_PT_MJPEG:
 					if len(payload) < 8:
 						chunk = payload
 						self.pushDataFragment(chunk, marker)
@@ -384,13 +379,12 @@ class Client:
 						block['recovered_at'] = None
 
 
-					if block['recovered_idx'] is not None and block['recovered_idx'] == index:
+					if block.get('recorvered_idx') == index:
 						continue
 
-					block['chunks'] = [(i, c) for (i, c) in block['chunks'] if i != index]
-					block['chunks'].append((index, chunk))
+					block['chunks'][index] = chunk
 
-					self.pushDataFragment(chunk, marker)
+					self.fecFlushBlock(block_id)
 					
 
 			# 	# Sequence gap handling
@@ -772,6 +766,9 @@ class Client:
 		# dropped_empty = 0
 		# last_log = time.monotonic()
 
+		loading = False
+		empty_since = None
+
 		while not self.stopPlayback.is_set() and self.teardownAcked == 0:
 			now = time.monotonic()
 			frame_interval = 1.0 / TARGET_FPS
@@ -781,11 +778,18 @@ class Client:
 
 			frame = self.buffer.pop()
 			if frame is None:
-				self.showLoading(True)
+				if empty_since is None:
+					empty_since = time.monotonic()
 				while frame is None and not self.stopPlayback.is_set() and self.teardownAcked == 0:
+					if not loading and (time.monotonic() - empty_since) > 1.5:
+						self.showLoading(True)
+						loading = True
 					frame = self.buffer.pop()
 					time.sleep(0.01)
-				self.showLoading(False)
+				if loading:
+					self.showLoading(False)
+					loading = False
+				empty_since = None
 
 			if frame is None:
 				# Playback stopping or still empty after wait
@@ -808,28 +812,35 @@ class Client:
 		block = self.fec_blocks.get(block_id)
 		if not block:
 			block = {
-				'chunks': [],
+				'chunks': {},
 				'group_size': None,
 				'parity': None,
 				'recovered_idx': None,
 				'recovered_at': None,
+				'flushed': False
 			}
 			self.fec_blocks[block_id] = block
 		return block
 	
 	def fecRecoverPacket(self, block_id):
 		block = self.fec_blocks.get(block_id)
+		if not block:
+			return None
 		group = block.get('group_size')
 		parity = block.get('parity')
 		if not group or parity is None:
 			return None
+
+		if block.get('recovered_idx') is not None:
+			idx = block['recovered_idx']
+			return (idx, block['chunks'].get(idx))
 		
 		present = len(block['chunks'])
 		if present != group - 1:
 			return None
 	
 		have = [False] * group
-		for idx, _payload in block['chunks']:
+		for idx in block['chunks'].keys():
 			if 0 <= idx < group:
 				have[idx] = True
 		try:
@@ -841,12 +852,37 @@ class Client:
 			time.sleep(min(0.030, max(0.0, self.fec_last_wait_ms / 1000.0)))
 
 		rec = parity
-		for idx, payload in block['chunks']:
+		for payload in block['chunks'].values():
 			rec = self._xor_bytes(rec, payload)
 
 		block['recovered_idx'] = missing_idx
+		block['chunks'][missing_idx] = rec
 		block['recovered_at'] = time.monotonic()
 		# Log successful recovery
-		present = len(block['chunks'])
 		print(f"[FEC] Recovered 1 missing packet in block {block_id} (group={group}, present={present}, len={len(rec)})")
 		return (missing_idx, rec)
+
+	def fecFlushBlock(self, block_id):
+		block = self.fec_blocks.get(block_id)
+		if not block or block.get('Flushed'):
+			return
+
+		group = block.get('group_size')
+		if not group:
+			return
+		
+		self.fecRecoverPacket(block_id)
+
+		if len(block['chunks']) < group:
+			# Packet loss, cannot flush now
+			return
+		
+		# Packet group is enough, flush by index order.
+		for idx in range(group):
+			chunk = block['chunks'].get(idx)
+			if chunk is None:
+				continue
+			self.pushDataFragment(chunk, marker=0)
+
+		block['flushed'] = True
+		del self.fec_blocks[block_id]

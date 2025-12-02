@@ -40,7 +40,7 @@ class ServerWorker:
 		self.jpeg_quality = 65
 		self.jpeg_subsampling = "4:2:0"
 		self.rtp_debug = True 		# set False to silence per-packet logs
-		self.developerMode = False  # Enable DeveloperMode FEC testing
+		self.developerMode = True  # Enable DeveloperMode FEC testing
 		# Small delay before sending FEC parity to mitigate UDP reordering
 		# Parity may arrive earlier than last data fragment on some stacks.
 		# Delay is in milliseconds; keep tiny to minimize added latency.
@@ -315,8 +315,8 @@ class ServerWorker:
 		frame_interval = 1.0 / target_fps
 
 		block_id = 0
-		fec_block_payloads = []       # list of payload bytes for current block
-		fec_block_seqnums = []		  # RTP seqnums in the block (for logging)
+		# fec_block_payloads = []       # list of payload bytes for current block
+		# fec_block_seqnums = []		  # RTP seqnums in the block (for logging)
 
 		while True:
 			# Stop if PAUSE or TEARDOWN signaled
@@ -331,7 +331,7 @@ class ServerWorker:
 				if fec_block_payloads:
 					self._send_fec_parity(rtpSocket, address, port, block_id, fec_block_payloads)
 					fec_block_payloads.clear()
-					fec_block_seqnums.clear()
+					# fec_block_seqnums.clear()
 					block_id += 1
 				break
 
@@ -350,11 +350,17 @@ class ServerWorker:
 			total_len = len(compressed)
 			offset = 0
 			n_frags = (total_len + MAX_PAYLOAD - 1)	// MAX_PAYLOAD
+
+			frags_left = n_frags
+			fec_block_payloads = []
+			block_group_size = None
+
 			# Spread fragments over frame_interval
 			# If there are many fragments, this maybe sub-ms; Python granularity isn't perfect, but it helps a lot.
 			per_frag_gap = frame_interval / max(n_frags, 1)
 			next_send_time = frame_start # Schedule first fragment at frame_start
 			frame_first_seq = self.seqnum + 1  # predicted first seq of this frame
+			frame_first_block = block_id # predicted first block of this frame
 
 			frag_idx = 0
 			while offset < total_len:
@@ -362,8 +368,13 @@ class ServerWorker:
 				if self.clientInfo['event'].isSet():
 					break
 
+				# If this is new block, decide group_size for this block
+				if len(fec_block_payloads) == 0:
+					block_group_size = min(self.FEC_GROUP_SIZE, frags_left)
+
 				chunk = compressed[offset:offset + MAX_PAYLOAD]
 				offset += len(chunk)
+				frags_left -= 1
 				
 				# Pace this segment
 				now = time.monotonic()
@@ -380,23 +391,31 @@ class ServerWorker:
 				data_header = (
 					block_id.to_bytes(4, 'big') +
 					index_in_block.to_bytes(2, 'big') +
-					self.FEC_GROUP_SIZE.to_bytes(2, 'big')
+					block_group_size.to_bytes(2, 'big')
 				)
 				mjpeg_payload = data_header + chunk
 				packet = self.makeRtp(mjpeg_payload, self.seqnum, marker, payload_type=self.RTP_PT_MJPEG)
 				# DeveloperMode: plan a drop at the start of a block to simulate a packet loss
-				if self.developerMode and random is not None and index_in_block == 0 and (block_id not in self._dev_drop_plan):
-					# 20% chance to enable test mode for this block
+				plan = self._dev_drop_plan.get(block_id)
+				if self.developerMode and random is not None and plan is None and index_in_block == 0:
+					# 5% chance to enable test mode for this block
 					if random.random() < 0.05:
-						if random.random() < 0.5:
-							idx = randint(0, self.FEC_GROUP_SIZE - 1)
-							self._dev_drop_plan[block_id] = {"type": "data", "index": idx}
+						if random.random() < 0.4:
+							idx = randint(0, block_group_size - 1)
+							self._dev_drop_plan[block_id] = {
+								"type": "data", 
+								"index": idx
+							}
 							if self.rtp_debug:
 								print(f"[DEV] Planned drop: data idx={idx} for block {block_id}")
 						else:
-							self._dev_drop_plan[block_id] = {"type": "parity", "index": -1}
+							self._dev_drop_plan[block_id] = {
+								"type": "parity", 
+								"index": -1
+							}
 							if self.rtp_debug:
 								print(f"[DEV] Planned drop: parity for block {block_id}")
+					plan = self._dev_drop_plan.get(block_id)
 
 				# Should we drop this data packet per plan?
 				drop_data = False
@@ -412,7 +431,7 @@ class ServerWorker:
 						if marker:
 							preset = self.server_target_height or 'Original'
 							print(f"[RTP] Frame #{self.clientInfo['videoStream'].frameNbr()} complete seq={frame_first_seq}-{self.seqnum} "
-							      f"totalBytes={total_len} frags={n_frags} preset={preset} q={self.jpeg_quality}")
+							      f"block={frame_first_block}-{block_id} totalBytes={total_len} frags={n_frags} preset={preset} q={self.jpeg_quality}")
 					else:
 						if self.rtp_debug:
 							print(f"[DEV] Dropped data fragment idx={len(fec_block_payloads)} in block {block_id}")
@@ -425,13 +444,13 @@ class ServerWorker:
 
 				# Collect payload and seq for FEC parity computation (even if dropped)
 				fec_block_payloads.append(chunk)
-				fec_block_seqnums.append(self.seqnum)
+				# fec_block_seqnums.append(self.seqnum)
 				
-				# If we have FEC_GROUP_SIZE data packets, send parity now and start next block
-				if len(fec_block_payloads) >= self.FEC_GROUP_SIZE:
+				# If we have enough block_group_size data packets, send parity now and start next block
+				if len(fec_block_payloads) >= block_group_size:
 					self._send_fec_parity(rtpSocket, address, port, block_id, fec_block_payloads)
 					fec_block_payloads.clear()
-					fec_block_seqnums.clear()
+					# fec_block_seqnums.clear()
 					block_id += 1
 
 				frag_idx += 1

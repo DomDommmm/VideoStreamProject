@@ -128,6 +128,17 @@ class Client:
 		# Helps avoid false recoveries when parity arrives before data due to UDP reordering
 		self.fec_last_wait_ms = 18
 
+		# === Network stats for adaptation ===
+		self.last_rx_seq = None				# last seen RTP seq (data only)
+		self.rx_expected = 0				# expected packets (by seq)
+		self.rx_received = 0				# received packets
+		self.rx_lost_seq = 0				# lost packets (gaps by seq)
+		self.fec_recovered_packets = 0		# packets recovered by FEC
+		self.buffer_underruns = 0			# number of times buffer ran empty during playback
+		self.net_profile = "HIGH"			# Network profile: HIGH, MED, LOW
+		self.adapt_stop = threading.Event()
+		self.adapt_thread = None
+
 	@staticmethod
 	def fecParseHeader(buf):
 		"""Return (block_id, group_size, fec_len)"""
@@ -190,9 +201,26 @@ class Client:
 		except Exception:
 			pass
 
+	def setResolutionUI(self, label):
+		"""
+		Update resolution dropdown selection in the UI.
+		label must be one of self.res_presets keys, e.g. 'Original', '480p', etc.
+		"""
+		if not self.master:
+			return
+		def _do():
+			if label in self.res_presets:
+				self.res_var.set(label)
+			
+		try:
+			self.master.after(0, _do)
+		except Exception as e:
+			print(f"[Client] setResolutionUI error: {e}")
+
 	def exitClient(self):
 		"""Immediately stop streaming, close sockets, and exit the app."""
 		# Signal listener to stop
+		self.adapt_stop.set()
 		try:
 			if hasattr(self, "playEvent") and self.playEvent:
 				self.playEvent.set()
@@ -271,6 +299,7 @@ class Client:
 			self.sendRtspRequest(self.PAUSE)
 			self.playEvent.set()
 			self.stopPlayback.set()
+			self.adapt_stop.set()
 			self.paused = True
 	
 	def playMovie(self):
@@ -289,6 +318,12 @@ class Client:
 			
 			self.playbackThread = threading.Thread(target=self.displayLoop, daemon=True)
 			self.playbackThread.start()
+
+			# start adaptation loop
+			self.adapt_stop.clear()
+			if self.adapt_thread is None or not self.adapt_thread.is_alive():
+				self.adapt_thread = threading.Thread(target=self.adaptationLoop, daemon=True)
+				self.adapt_thread.start()
 
 	def onResolutionSelected(self, label):
 		"""
@@ -314,7 +349,7 @@ class Client:
 		try:
 			self.rtspSocket.send(request.encode())
 			print(f"[Client] Requested resolution change to {label} ({desired or 'Original'}). CSeq={self.rtspSeq}")
-			self.requestSent = getattr(self, 'RESOLUTION', 4)
+			self.requestSent = self.RESOLUTION
 		except Exception as e:
 			print(f"[Client] Failed to send RESOLUTION: {e}")
 	
@@ -358,6 +393,20 @@ class Client:
 					block['parity'] = parity
 					self.fecFlushBlock(block_id)
 				elif pt == self.RTP_PT_MJPEG:
+					# Update packet loss stats
+					if self.last_rx_seq is None:
+						self.last_rx_seq = seq
+					else:
+						delta = (seq - self.last_rx_seq) & 0xFFFF
+						if delta > 0:
+							if delta > 1:
+								self.rx_lost_seq += (delta - 1)
+							self.rx_expected += delta
+							self.last_rx_seq = seq
+						else:
+							pass # out-of-order or duplicate
+					self.rx_received += 1
+
 					if len(payload) < 8:
 						chunk = payload
 						self.pushDataFragment(chunk, marker)
@@ -784,6 +833,9 @@ class Client:
 					if not loading and (time.monotonic() - empty_since) > 1.5:
 						self.showLoading(True)
 						loading = True
+						# count underrun once per event
+						self.buffer_underruns += 1
+						print(f"[Client] Buffer underrun #{self.buffer_underruns}")
 					frame = self.buffer.pop()
 					time.sleep(0.01)
 				if loading:
@@ -859,12 +911,13 @@ class Client:
 		block['chunks'][missing_idx] = rec
 		block['recovered_at'] = time.monotonic()
 		# Log successful recovery
+		self.fec_recovered_packets += 1 # Global stat
 		print(f"[FEC] Recovered 1 missing packet in block {block_id} (group={group}, present={present}, len={len(rec)})")
 		return (missing_idx, rec)
 
 	def fecFlushBlock(self, block_id):
 		block = self.fec_blocks.get(block_id)
-		if not block or block.get('Flushed'):
+		if not block or block.get('flushed'):
 			return
 
 		group = block.get('group_size')
@@ -886,3 +939,122 @@ class Client:
 
 		block['flushed'] = True
 		del self.fec_blocks[block_id]
+
+	def sendProfile(self, profile, height):
+		"""
+		profile: "HIGH" | "MED" | "LOW"
+		height: int or 0 (original)
+		"""
+		if self.sessionId == 0:
+			return
+		
+		self.rtspSeq += 1
+		desired = 0 if height is None else int(height)
+		request = (
+			f"RESOLUTION {self.fileName} RTSP/1.0\n"
+			f"CSeq: {self.rtspSeq}\n"
+			f"Session: {self.sessionId}\n"
+			f"X-Resolution: {desired}\n"
+			f"X-Profile: {profile}\n\n"
+		)
+		try:
+			self.rtspSocket.send(request.encode())
+			print(f"[Client] Sent profile={profile}, height={desired or 'Original'} CSeq={self.rtspSeq}")
+			self.requestSent = self.RESOLUTION
+		except Exception as e:
+			print(f"[Client] Failed to send profile RESOLUTION: {e}")
+
+	def adaptationLoop(self):
+		"""Periodic network health check and bitrate adaptation."""
+		print("[Client] Adaptation thread started.")
+
+		last_rx_expected = self.rx_expected
+		last_rx_lost = self.rx_lost_seq
+		last_fec = self.fec_recovered_packets
+		last_underruns = self.buffer_underruns
+
+		good_count = 0
+		bad_count = 0
+
+		while not self.adapt_stop.is_set() and self.teardownAcked == 0:
+			time.sleep(3.0)
+
+			exp = self.rx_expected
+			lost = self.rx_lost_seq
+			fec = self.fec_recovered_packets
+			und = self.buffer_underruns
+
+			d_exp = max(0, exp - last_rx_expected)
+			d_lost = max(0, lost - last_rx_lost)
+			d_fec = max(0, fec - last_fec)
+			d_und = max(0, und - last_underruns)
+
+			last_rx_expected = exp
+			last_rx_lost = lost
+			last_fec = fec
+			last_underruns = und
+
+			if d_exp == 0:
+				continue
+
+			loss_rate = d_lost / d_exp
+			recovery_rate = d_fec / d_exp
+
+			print(f"[Adapt] window: loss={loss_rate*100:.2f}% "
+		 		  f"recovery={recovery_rate*100:.2f}% underrun={d_und} profile={self.net_profile}")
+			
+			bad = (loss_rate > 0.05) or (d_und > 0)
+			good = (loss_rate < 0.01) and (d_und == 0)
+
+			if bad:
+				bad_count += 2
+				good_count = 0
+			elif good:
+				good_count += 1
+				bad_count = 0
+			else:
+				bad_count = max(0, bad_count - 1)
+				good_count = max(0, good_count - 1)
+
+			if bad_count >= 1:
+				self.adaptDown()
+				bad_count = 0
+			elif good_count >= 3:
+				self.adaptUp()
+				good_count = 0
+
+	def adaptDown(self):
+		old = self.net_profile
+		if old == "HIGH":
+			self.net_profile = "MED"
+			height = self.res_presets.get("480p", 480)
+		elif old == "MED":
+			self.net_profile = "LOW"
+			height = self.res_presets.get("360p", 360)
+		else:
+			return
+		
+		print(f"[Adapt] Network degraded; switching profile {old} -> {self.net_profile}")
+		try:
+			self.sendProfile(self.net_profile, height)
+			self.setResolutionUI({ "HIGH": "Original", "MED": "480p", "LOW": "360p" }[self.net_profile])
+		except Exception as e:
+			print(f"[Adapt] adaptDown sendProfile error: {e}")
+		
+	def adaptUp(self):
+		old = self.net_profile
+		if old == "LOW":
+			self.net_profile = "MED"
+			height = self.res_presets.get("480p", 480)
+		elif old == "MED":
+			self.net_profile = "HIGH"
+			height = self.res_presets.get("Original", None)
+		else:
+			return
+		
+		print(f"[Adapt] Network improved; switching profile {old} -> {self.net_profile}")
+		try:
+			self.sendProfile(self.net_profile, height)
+			self.setResolutionUI({ "HIGH": "Original", "MED": "480p", "LOW": "360p" }[self.net_profile])
+		except Exception as e:
+			print(f"[Adapt] adaptUp sendProfile error: {e}")

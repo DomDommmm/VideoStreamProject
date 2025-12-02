@@ -25,7 +25,6 @@ class ServerWorker:
 	FILE_NOT_FOUND_404 = 1
 	CON_ERR_500 = 2
 
-	FEC_GROUP_SIZE = 10
 	RTP_PT_MJPEG = 26
 	RTP_PT_FEC = 127
 	DATA_FEC_HEADER_SIZE = 8  # 4 bytes block_id + 2 bytes group_size + 2 bytes fec_len
@@ -50,6 +49,11 @@ class ServerWorker:
 		# Example: {"type": "data", "index": 3} means drop data fragment #3 of the 10;
 		# {"type": "parity"} means drop the parity packet for that block.
 		self._dev_drop_plan = {}
+
+		self.jpeg_quality = 65
+		self.jpeg_subsampling = "4:2:0"
+		self.max_payload = 1100
+		self.FEC_GROUP_SIZE = 10
 
 	@staticmethod
 	def _fec_make_header(block_id, group_size, fec_len):
@@ -109,6 +113,31 @@ class ServerWorker:
 		
 	def run(self):
 		threading.Thread(target=self.recvRtspRequest).start()
+
+	def applyProfile(self, profile):
+		"""
+		profile: "HIGH" | "MED" | "LOW"
+		Update resolution, quality, packet size, FEC group size
+		"""
+		if profile == "HIGH":
+			self.server_target_height = None  # Original
+			self.jpeg_quality = 70
+			self.max_payload = 1100
+			self.FEC_GROUP_SIZE = 10 # 10% overhead
+		elif profile == "MED":
+			self.server_target_height = 480
+			self.jpeg_quality = 60
+			self.max_payload = 1000
+			self.FEC_GROUP_SIZE = 8  # 12.5% overhead
+		else:
+			self.server_target_height = 360
+			self.jpeg_quality = 50
+			self.max_payload = 900
+			self.FEC_GROUP_SIZE = 6  # 16.67% overhead
+		if self.rtp_debug:
+			print(f"[RTSP Server] Applied profile={profile}, "
+		 		  f"h={self.server_target_height or 'Original'}, q={self.jpeg_quality}, "
+				  f"payload={self.max_payload}, FEC_GROUP={self.FEC_GROUP_SIZE}")
 	
 	def recvRtspRequest(self):
 		"""Receive RTSP request from the client."""
@@ -262,8 +291,11 @@ class ServerWorker:
 			except Exception:
 				desired_h = 0
 			self.server_target_height = None if desired_h == 0 else desired_h
+			profile = headers.get('X-Profile', '').upper() or None
+			if profile is not None:
+				self.applyProfile(profile)
 			if self.rtp_debug:
-				print(f"[RTSP Server] RESOLUTION {desired_h or 'Original'} accepted.")
+				print(f"[RTSP Server] RESOLUTION {desired_h or 'Original'} accepted, profile={profile or 'None'}.")
 			self.replyRtsp(self.OK_200, seq)
 
 		# Process TEARDOWN request
@@ -299,7 +331,7 @@ class ServerWorker:
 			
 	def sendRtp(self):
 		"""Send RTP packets over UDP."""
-		MAX_PAYLOAD = 1100
+		MAX_PAYLOAD = self.max_payload
 		rtpSocket = self.clientInfo['rtpSocket']
 		address = self.clientInfo['rtspSocket'][1][0]
 		port = int(self.clientInfo['rtpPort'])

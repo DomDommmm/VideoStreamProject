@@ -516,8 +516,9 @@ class ServerWorker:
 							    #   f"frag={frag_idx + 1}/{n_frags} size={len(chunk)} bytes marker={marker}")
 						if marker:
 							preset = self.server_target_height or 'Original'
-							print(f"[RTP] Frame #{self.clientInfo['videoStream'].frameNbr()} complete seq={frame_first_seq}-{self.seqnum} "
-							      f"block={frame_first_block}-{block_id} totalBytes={total_len} frags={n_frags} preset={preset} q={self.jpeg_quality}")
+							if self.rtp_debug:
+								print(f"[RTP] Frame #{self.clientInfo['videoStream'].frameNbr()} complete seq={frame_first_seq}-{self.seqnum} "
+							      	  f"block={frame_first_block}-{block_id} totalBytes={total_len} frags={n_frags} preset={preset} q={self.jpeg_quality}")
 					else:
 						if self.rtp_debug:
 							print(f"[DEV] Dropped data fragment idx={len(fec_block_payloads)} in block {block_id}")

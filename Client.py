@@ -1,4 +1,5 @@
 from tkinter import *
+from tkinter import ttk
 import tkinter.messagebox as tkMessageBox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
@@ -65,9 +66,10 @@ class Client:
 	PAUSE = 2
 	TEARDOWN = 3
 	RESOLUTION = 4
+	SEEK = 5
 	
 	# Initiation..
-	def __init__(self, master, serveraddr, serverport, rtpport, filename):
+	def __init__(self, master, serveraddr, serverport, rtpport, filename, debug=False):
 		self.master = master
 		self.master.protocol("WM_DELETE_WINDOW", self.handler)
 		self.serverAddr = serveraddr
@@ -96,6 +98,8 @@ class Client:
 		self.res_var = None
 		self.last_frame_size = None
 		self.base_display_size = None # (w, h) window-fit set on first frame
+		self.progress_var = DoubleVar(self.master)
+		self.frame_label_var = StringVar(self.master, value="0 / ?")
 		self.createWidgets()
 		self.seqnum = 0 # RTP seq
 		self._rtspClosing = False
@@ -103,6 +107,9 @@ class Client:
 		self.SOI = b"\xff\xd8"
 		self.EOI = b"\xff\xd9"
 		self.MAX_FRAME_BYTES = 2 * 1024 * 1024  # 2MB safety cap
+
+		self.seeking = False
+		self.total_frames = None
 		
 		self.buffer = FrameBuffer(MAX_BUFFER)
 		self.playbackThread = None
@@ -116,6 +123,7 @@ class Client:
 
 		self.assembled_count = 0
 		self.displayed_count = 0
+		self.last_seek_fraction = 0.0
 
 		# self.FEC_GROUP_SIZE = 10
 		self.RTP_PT_MJPEG = 26
@@ -138,6 +146,8 @@ class Client:
 		self.net_profile = "HIGH"			# Network profile: HIGH, MED, LOW
 		self.adapt_stop = threading.Event()
 		self.adapt_thread = None
+
+		self.rtp_debug = debug
 
 	@staticmethod
 	def fecParseHeader(buf):
@@ -193,6 +203,26 @@ class Client:
 		self.label = Label(self.master)
 		self.label.grid(row=0, column=0, columnspan=5, sticky=W+E+N+S, padx=5, pady=5)
 
+		style = ttk.Style(self.master)
+		style.configure("TScale", troughrelief="flat", thickness=10)
+		self.progress = ttk.Scale(
+			self.master,
+			from_=0, to=100,
+			orient=HORIZONTAL,
+			variable=self.progress_var,
+			length=400,
+		)
+		self.progress.grid(row=2, column=0, columnspan=4, sticky=W+E, padx=5, pady=(0, 5))
+		self.progress.bind("<Button-1>", self.onSeekStart)
+		self.progress.bind("<ButtonRelease-1>", self.onSeekRelease)
+		self.frame_label = ttk.Label(
+			self.master,
+			textvariable=self.frame_label_var,
+			width=12,
+			anchor="e"
+		)
+		self.frame_label.grid(row=2, column=4, sticky=E, padx=(0, 10), pady=(0, 5))
+
 		# Make grid responsive for 5 columns
 		try:
 			for c in range(5):
@@ -215,7 +245,50 @@ class Client:
 		try:
 			self.master.after(0, _do)
 		except Exception as e:
-			print(f"[Client] setResolutionUI error: {e}")
+			if self.rtp_debug:
+				print(f"[Client] setResolutionUI error: {e}")
+
+	def updateProgressUI(self, fraction: float):
+		"""
+		Update the slider according to current playback fraction [0.0, 1.0]
+		If total duration is unknown, you can pass an approximate fraction.
+		"""
+		if self.seeking:
+			# User is dragging the bar; ignore programmatic updates
+			return
+		f = max(0.0, min(1.0, float(fraction)))
+		value = f * 100.0
+
+		def _do():
+			try:
+				self.progress_var.set(value)
+			except Exception:
+				pass
+
+		try:
+			self.master.after(0, _do)
+		except Exception as e:
+			if self.rtp_debug:
+				print(f"[Client] updateProgressUI error: {e}")
+
+	def updateFrameCounterUI(self):
+		"""Update the frame counter label in the UI."""
+		if self.total_frames:
+			txt = f"{self.displayed_count} / {self.total_frames}"
+		else:
+			txt = f"{self.displayed_count}"
+
+		def _do():
+			try:
+				self.frame_label_var.set(txt)
+			except Exception:
+				pass
+
+		try:
+			self.master.after(0, _do)
+		except Exception as e:
+			if self.rtp_debug:
+				print(f"[Client] updateFrameCounterUI error: {e}")
 
 	def exitClient(self):
 		"""Immediately stop streaming, close sockets, and exit the app."""
@@ -335,23 +408,65 @@ class Client:
 		
 		# Only send if we have a valid RTSP session ID (After SETUP)
 		if self.sessionId == 0:
-			print(f"[Client] Resolution set locally to {label}")
+			if self.rtp_debug:
+				print(f"[Client] Resolution set locally to {label}")
+			return
+		desired = 0 if height is None else int(height)
+
+		# Send RESOLUTION request
+		self.sendRtspRequest(self.RESOLUTION, desired)
+
+	def onSeekStart(self, event):
+		"""User started dragging the progress bar."""
+		self.seeking = True
+
+	def onSeekRelease(self, event):
+		"""User released the progres bar; send SEEK request."""
+		self.seeking = False
+		if self.sessionId == 0:
 			return
 		
-		self.rtspSeq += 1
-		desired = 0 if height is None else int(height)
-		request = (
-			f"RESOLUTION {self.fileName} RTSP/1.0\n"
-			f"CSeq: {self.rtspSeq}\n"
-			f"Session: {self.sessionId}\n"
-			f"X-Resolution: {desired}\n\n"
-		)
+		pct = self.progress_var.get()
+		fraction = max(0.0, min(1.0, pct / 100.0))
+		self.seekTo(fraction)
+
+	def seekTo(self, fraction: float):
+		"""
+		Send a custom RTSP SEEK request with normalized position [0.0, 1.0].
+		We also flush client-side buffers so only new frames from the seek target are shown.
+		"""
+
+		if self.sessionId == 0:
+			return
+		pos = max(0.0, min(1.0, float(fraction)))
+		self.last_seek_fraction = pos
 		try:
-			self.rtspSocket.send(request.encode())
-			print(f"[Client] Requested resolution change to {label} ({desired or 'Original'}). CSeq={self.rtspSeq}")
-			self.requestSent = self.RESOLUTION
+			self.buffer.clear()
+			self.frameBuffer.clear()
+			self.fec_blocks.clear()
+			self.last_rx_seq = None
+			self.rx_expected = 0
+			self.rx_received = 0
+			self.rx_lost_seq = 0
+			self.fec_recovered_packets = 0
+			target_idx = 0
+			if self.total_frames:
+				target_idx = int(pos * max(0, self.total_frames - 1))
+			self.assembled_count = target_idx
+			self.displayed_count = target_idx
+			self.updateFrameCounterUI()
+		except Exception:
+			pass
+
+		try:
+			self.sendRtspRequest(self.SEEK, target_frame=pos)
+			if self.rtp_debug:
+				print(f"[Client] Requested SEEK to {pos*100:.1f}% (CSeq={self.rtspSeq})")
+			self.resync = True
+			self.resume_until = time.monotonic() + (self.resume_grace_ms / 1000.0)
 		except Exception as e:
-			print(f"[Client] Failed to send RESOLUTION: {e}")
+			if self.rtp_debug:
+				print(f"[Client] seekTo error: {e}")
 	
 	def listenRtp(self):		
 		"""Receive RTP packets, reassemble frames, and push completed frames into jitter buffer."""
@@ -373,6 +488,20 @@ class Client:
 				marker = rtpPacket.marker()
 				payload = rtpPacket.getPayload()
 
+				# Update packet loss stats
+				if self.last_rx_seq is None:
+					self.last_rx_seq = seq
+				else:
+					delta = (seq - self.last_rx_seq) & 0xFFFF
+					if delta > 0:
+						if delta > 1:
+							self.rx_lost_seq += (delta - 1)
+						self.rx_expected += delta
+						self.last_rx_seq = seq
+					else:
+						pass # out-of-order or duplicate
+				self.rx_received += 1
+
 				if pt == self.RTP_PT_FEC:
 					fec_payload = rtpPacket.getPayload()
 					hdr = self.fecParseHeader(fec_payload[:8])
@@ -393,20 +522,6 @@ class Client:
 					block['parity'] = parity
 					self.fecFlushBlock(block_id)
 				elif pt == self.RTP_PT_MJPEG:
-					# Update packet loss stats
-					if self.last_rx_seq is None:
-						self.last_rx_seq = seq
-					else:
-						delta = (seq - self.last_rx_seq) & 0xFFFF
-						if delta > 0:
-							if delta > 1:
-								self.rx_lost_seq += (delta - 1)
-							self.rx_expected += delta
-							self.last_rx_seq = seq
-						else:
-							pass # out-of-order or duplicate
-					self.rx_received += 1
-
 					if len(payload) < 8:
 						chunk = payload
 						self.pushDataFragment(chunk, marker)
@@ -428,80 +543,27 @@ class Client:
 						block['recovered_at'] = None
 
 
-					if block.get('recorvered_idx') == index:
+					if block.get('recovered_idx') == index:
 						continue
 
 					block['chunks'][index] = chunk
+					block['markers'][index] = marker
 
 					self.fecFlushBlock(block_id)
-					
-
-			# 	# Sequence gap handling
-			# 	if lastSeq is not None and seq != lastSeq + 1:
-			# 		# Drop partial frame
-			# 		partial.clear()
-			# 		lastSeq = None
-
-			# 	# If paused, flush any in-flight assembly and wait
-			# 	if self.paused:
-			# 		partial.clear()
-			# 		lastSeq = None
-			# 		self.paused = False
-
-			# 	# Resync after resume: ignore non-SOI until grace deadline or first clean SOI
-			# 	if len(partial) == 0:
-			# 		now = time.monotonic()
-			# 		if self.resync:
-			# 			if now <= self.resume_until:
-			# 				if not payload.startswith(self.SOI):
-			# 					lastSeq = None
-			# 					continue
-			# 			else:
-			# 				if not payload.startswith(self.SOI):
-			# 					lastSeq = None
-			# 					continue
-			# 		# First clean SOI found after resume
-			# 		self.resync = False
-
-			# 	partial.extend(payload)
-			# 	lastSeq = seq
-
-			# 	# Safety cap
-			# 	if len(partial) > self.MAX_FRAME_BYTES:
-			# 		print(f"[Client] Oversized frame ({len(partial)} bytes) dropped.")
-			# 		partial.clear()
-			# 		lastSeq = None
-			# 		continue
-
-			# 	if marker == 1:
-			# 		# Validate SOI/EOI
-			# 		if not (partial.startswith(self.SOI) and partial.endswith(self.EOI)):
-			# 			print(f"[Client] Incomplete JPEG dropped size={len(partial)} seq={seq}")
-			# 			partial.clear()
-			# 			lastSeq = None
-			# 			continue
-
-			# 		size_before_clear = len(partial)
-			# 		pushed = self.buffer.push(bytes(partial))
-			# 		if pushed:
-			# 			self.assembled_count += 1
-			# 			print(f"[Client] Receive frame #{self.assembled_count} buf={self.buffer.size()} size={size_before_clear}")
-			# 		else:
-			# 			print("[Client] Buffer full; frame dropped.")
-			# 		partial.clear()
-			# 		lastSeq = None
 
 			except socket.timeout:
 				if self.playEvent.isSet() or self.teardownAcked == 1:
 					break
 				timeouts += 1
 				if timeouts % 10 == 0:
-					print("[Client] Waiting for RTP...")
+					if self.rtp_debug:
+						print("[Client] Waiting for RTP...")
 				continue
 			except Exception as e:
 				if self.playEvent.isSet() or self.teardownAcked == 1:
 					break
-				print(f"[Client] listenRtp error: {e}")
+				if self.rtp_debug:
+					print(f"[Client] listenRtp error: {e}")
 				traceback.print_exc()
 				continue
 
@@ -541,7 +603,8 @@ class Client:
 
 			# Safety cap
 			if len(self.frameBuffer) > self.MAX_FRAME_BYTES:
-				print(f"[Client] Oversized frame ({len(self.frameBuffer)} bytes) dropped.")
+				if self.rtp_debug:
+					print(f"[Client] Oversized frame ({len(self.frameBuffer)} bytes) dropped.")
 				self.frameBuffer.clear()
 				# self.lastSeq = None
 				return
@@ -549,7 +612,8 @@ class Client:
 			# End of frame
 			if marker == 1 or payload.endswith(self.EOI):
 				if not (self.frameBuffer.startswith(self.SOI) and self.frameBuffer.endswith(self.EOI)):
-					print(f"[Client] Incomplete JPEG dropped size={len(self.frameBuffer)}")
+					if self.rtp_debug:
+						print(f"[Client] Incomplete JPEG dropped size={len(self.frameBuffer)}")
 					self.frameBuffer.clear()
 					self.lastSeq = None
 					return
@@ -558,13 +622,16 @@ class Client:
 				pushed = self.buffer.push(bytes(self.frameBuffer))
 				if pushed:
 					self.assembled_count += 1
-					print(f"[Client] Receive frame #{self.assembled_count} buf={self.buffer.size()} size={size_before_clear}")
+					if self.rtp_debug:
+						print(f"[Client] Receive frame #{self.assembled_count} buf={self.buffer.size()} size={size_before_clear}")
 				else:
-					print("[Client] Buffer full; frame dropped.")
+					if self.rtp_debug:
+						print("[Client] Buffer full; frame dropped.")
 				self.frameBuffer.clear()
 				# self.lastSeq = None
 		except Exception as e:
-			print(f"[Client] pushDataFragment error: {e}")
+			if self.rtp_debug:
+				print(f"[Client] pushDataFragment error: {e}")
 			self.frameBuffer.clear()
 			# self.lastSeq = None
 
@@ -609,7 +676,7 @@ class Client:
 		except:
 			tkMessageBox.showwarning('Connection Failed', 'Connection to \'%s\' failed.' %self.serverAddr)
 	
-	def sendRtspRequest(self, requestCode):
+	def sendRtspRequest(self, requestCode, desired=None, target_frame=None):
 		"""Send RTSP request to the server."""
 		
 		# Setup request
@@ -674,9 +741,26 @@ class Client:
 			
 			# Keep track of the sent request.
 			self.requestSent = self.TEARDOWN
-		else:
-			return
-		
+		elif requestCode == self.RESOLUTION and self.state != self.INIT:
+			self.rtspSeq += 1
+
+			request = (
+				f"RESOLUTION {self.fileName} RTSP/1.0\n"
+				f"CSeq: {self.rtspSeq}\n"
+				f"Session: {self.sessionId}\n"
+				f"X-Resolution: {desired}\n\n"
+			)		
+			self.requestSent = self.RESOLUTION
+		elif requestCode == self.SEEK and self.state != self.INIT:
+			self.rtspSeq += 1
+
+			request = (
+				f"SEEK {self.fileName} RTSP/1.0\n"
+				f"CSeq: {self.rtspSeq}\n"
+				f"Session: {self.sessionId}\n"
+				f"X-Seek: {target_frame:.6f}\n\n"
+			)		
+			self.requestSent = self.SEEK
 		# Send the RTSP request using rtspSocket.
 		try:
 			self.rtspSocket.send(request.encode())
@@ -735,7 +819,17 @@ class Client:
 						# Reset stats for a fresh session
 						self.assembled_count = 0
 						self.displayed_count = 0
+						# Parse X-TotalFrames header if server sends it
+						for ln in lines[3:]:
+							if ln.lower().startswith("x-totalframes:"):
+								try:
+									self.total_frames = int(ln.split(":", 1)[1].strip())
+									if self.rtp_debug:
+										print(f"[Client] Total frames in stream: {self.total_frames}")
+								except Exception:
+									pass
 				
+						self.updateFrameCounterUI()
 						# Open RTP port.
 						self.openRtpPort() 
 					elif self.requestSent == self.PLAY:
@@ -751,7 +845,20 @@ class Client:
 						# The play thread exits. A new thread is created on resume.
 						self.playEvent.set()
 					elif self.requestSent == self.RESOLUTION:
-						print("[Client] Resolution change acknowledged by server.")
+						if self.rtp_debug:
+							print("[Client] Resolution change acknowledged by server.")
+					elif self.requestSent == self.SEEK:
+						try:
+							frac = getattr(self, "last_seek_fraction", 0.0)
+							if self.total_frames:
+								target_idx = int(frac * max(0, self.total_frames - 1))
+								self.assembled_count = target_idx
+								self.displayed_count = target_idx
+							self.updateProgressUI(frac)
+						except Exception:
+							pass
+						if self.rtp_debug:
+							print("[Client] Seek acknowledged by server.")
 					elif self.requestSent == self.TEARDOWN:
 						self.state = self.INIT
 						
@@ -778,9 +885,11 @@ class Client:
 			# Read back OS-assigned buffer to confirm
 			try:
 				bufsz = self.rtpSocket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-				print(f"Binded RTP port: {self.rtpPort} (SO_RCVBUF={bufsz} bytes)")
+				if self.rtp_debug:
+					print(f"Binded RTP port: {self.rtpPort} (SO_RCVBUF={bufsz} bytes)")
 			except Exception:
-				print(f"Binded RTP port: {self.rtpPort}")
+				if self.rtp_debug:
+					print(f"Binded RTP port: {self.rtpPort}")
 		except OSError as e:
 			tkMessageBox.showwarning('Unable to Bind', 'Unable to bind PORT=%d' %self.rtpPort)
 			try:
@@ -797,7 +906,8 @@ class Client:
 		# Wait for prebuffer or timeout
 		while self.buffer.size() < PREBUFFER_MIN:
 			if (time.monotonic() - start_wait) > PREBUFFER_TIMEOUT:
-				print("[Client] Prebuffer timeout; starting playback with fewer frames.")
+				if self.rtp_debug:
+					print("[Client] Prebuffer timeout; starting playback with fewer frames.")
 				break
 			if self.stopPlayback.is_set() or self.teardownAcked == 1:
 				self.showLoading(False)
@@ -805,7 +915,8 @@ class Client:
 			time.sleep(0.01)
 		self.showLoading(False)
 
-		print(f"[Client] Playback starting. Initial buffered frames={self.buffer.size()}")
+		if self.rtp_debug:
+			print(f"[Client] Playback starting. Initial buffered frames={self.buffer.size()}")
 
 		frame_interval = 1.0 / TARGET_FPS
 		now = time.monotonic()
@@ -835,7 +946,8 @@ class Client:
 						loading = True
 						# count underrun once per event
 						self.buffer_underruns += 1
-						print(f"[Client] Buffer underrun #{self.buffer_underruns}")
+						if self.rtp_debug:
+							print(f"[Client] Buffer underrun #{self.buffer_underruns}")
 					frame = self.buffer.pop()
 					time.sleep(0.01)
 				if loading:
@@ -858,13 +970,20 @@ class Client:
 
 			self.displayed_count += 1
 			stats = self.buffer.stats()
-			print(f"[Client] Stats: displayed={self.displayed_count} buf={stats['size']} overflowDrops={stats['dropped_overflow']}")
+			if self.rtp_debug:
+				print(f"[Client] Stats: displayed={self.displayed_count} buf={stats['size']} overflowDrops={stats['dropped_overflow']}")
+
+			if self.total_frames:
+				fraction = min(1.0, self.displayed_count / self.total_frames)
+				self.updateProgressUI(fraction)
+			self.updateFrameCounterUI()
 
 	def fecGetBlock(self, block_id):
 		block = self.fec_blocks.get(block_id)
 		if not block:
 			block = {
 				'chunks': {},
+				'markers': {},
 				'group_size': None,
 				'parity': None,
 				'recovered_idx': None,
@@ -886,6 +1005,9 @@ class Client:
 		if block.get('recovered_idx') is not None:
 			idx = block['recovered_idx']
 			return (idx, block['chunks'].get(idx))
+		
+		if group <= 1:
+			return None
 		
 		present = len(block['chunks'])
 		if present != group - 1:
@@ -909,10 +1031,13 @@ class Client:
 
 		block['recovered_idx'] = missing_idx
 		block['chunks'][missing_idx] = rec
+		# If no marker observed in this block yet, assume missing packet carried it
+		block['markers'][missing_idx] = 0 if any(v == 1 for v in block['markers'].values()) else 1
 		block['recovered_at'] = time.monotonic()
 		# Log successful recovery
 		self.fec_recovered_packets += 1 # Global stat
-		print(f"[FEC] Recovered 1 missing packet in block {block_id} (group={group}, present={present}, len={len(rec)})")
+		if self.rtp_debug:
+			print(f"[FEC] Recovered 1 missing packet in block {block_id} (group={group}, present={present}, len={len(rec)})")
 		return (missing_idx, rec)
 
 	def fecFlushBlock(self, block_id):
@@ -924,10 +1049,12 @@ class Client:
 		if not group:
 			return
 		
-		self.fecRecoverPacket(block_id)
+		# Only recover if exactly one missing and parity available
+		if len(block['chunks']) == group - 1 and block.get('parity') is not None:
+			self.fecRecoverPacket(block_id)
 
 		if len(block['chunks']) < group:
-			# Packet loss, cannot flush now
+			# Still missing packets; wait for more data
 			return
 		
 		# Packet group is enough, flush by index order.
@@ -935,7 +1062,8 @@ class Client:
 			chunk = block['chunks'].get(idx)
 			if chunk is None:
 				continue
-			self.pushDataFragment(chunk, marker=0)
+			marker = block['markers'].get(idx, 0)
+			self.pushDataFragment(chunk, marker=marker)
 
 		block['flushed'] = True
 		del self.fec_blocks[block_id]
@@ -959,14 +1087,16 @@ class Client:
 		)
 		try:
 			self.rtspSocket.send(request.encode())
-			print(f"[Client] Sent profile={profile}, height={desired or 'Original'} CSeq={self.rtspSeq}")
+			if self.rtp_debug:
+				print(f"[Client] Sent profile={profile}, height={desired or 'Original'} CSeq={self.rtspSeq}")
 			self.requestSent = self.RESOLUTION
 		except Exception as e:
 			print(f"[Client] Failed to send profile RESOLUTION: {e}")
 
 	def adaptationLoop(self):
 		"""Periodic network health check and bitrate adaptation."""
-		print("[Client] Adaptation thread started.")
+		if self.rtp_debug:
+			print("[Client] Adaptation thread started.")
 
 		last_rx_expected = self.rx_expected
 		last_rx_lost = self.rx_lost_seq
@@ -1000,14 +1130,15 @@ class Client:
 			loss_rate = d_lost / d_exp
 			recovery_rate = d_fec / d_exp
 
-			print(f"[Adapt] window: loss={loss_rate*100:.2f}% "
-		 		  f"recovery={recovery_rate*100:.2f}% underrun={d_und} profile={self.net_profile}")
+			if self.rtp_debug:
+				print(f"[Adapt] window: loss={loss_rate*100:.2f}% "
+		 		  	  f"recovery={recovery_rate*100:.2f}% underrun={d_und} profile={self.net_profile}")
 			
 			bad = (loss_rate > 0.05) or (d_und > 0)
 			good = (loss_rate < 0.01) and (d_und == 0)
 
 			if bad:
-				bad_count += 2
+				bad_count += 1
 				good_count = 0
 			elif good:
 				good_count += 1
@@ -1016,7 +1147,7 @@ class Client:
 				bad_count = max(0, bad_count - 1)
 				good_count = max(0, good_count - 1)
 
-			if bad_count >= 1:
+			if bad_count >= 2:
 				self.adaptDown()
 				bad_count = 0
 			elif good_count >= 3:
@@ -1034,12 +1165,14 @@ class Client:
 		else:
 			return
 		
-		print(f"[Adapt] Network degraded; switching profile {old} -> {self.net_profile}")
+		if self.rtp_debug:
+			print(f"[Adapt] Network degraded; switching profile {old} -> {self.net_profile}")
 		try:
 			self.sendProfile(self.net_profile, height)
 			self.setResolutionUI({ "HIGH": "Original", "MED": "480p", "LOW": "360p" }[self.net_profile])
 		except Exception as e:
-			print(f"[Adapt] adaptDown sendProfile error: {e}")
+			if self.rtp_debug:
+				print(f"[Adapt] adaptDown sendProfile error: {e}")
 		
 	def adaptUp(self):
 		old = self.net_profile
@@ -1052,9 +1185,11 @@ class Client:
 		else:
 			return
 		
-		print(f"[Adapt] Network improved; switching profile {old} -> {self.net_profile}")
+		if self.rtp_debug:
+			print(f"[Adapt] Network improved; switching profile {old} -> {self.net_profile}")
 		try:
 			self.sendProfile(self.net_profile, height)
 			self.setResolutionUI({ "HIGH": "Original", "MED": "480p", "LOW": "360p" }[self.net_profile])
 		except Exception as e:
-			print(f"[Adapt] adaptUp sendProfile error: {e}")
+			if self.rtp_debug:
+				print(f"[Adapt] adaptUp sendProfile error: {e}")

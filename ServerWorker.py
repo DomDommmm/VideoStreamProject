@@ -15,6 +15,7 @@ class ServerWorker:
 	PAUSE = 'PAUSE'
 	TEARDOWN = 'TEARDOWN'
 	RESOLUTION = 'RESOLUTION'
+	SEEK = 'SEEK'
 	
 	INIT = 0
 	READY = 1
@@ -31,15 +32,15 @@ class ServerWorker:
 	
 	clientInfo = {}
 	
-	def __init__(self, clientInfo):
+	def __init__(self, clientInfo, developerMode=False, rtpDebug=True):
 		self.clientInfo = clientInfo
 		# Initialize RTP sequence number counter (increments per RTP packet)
 		self.seqnum = 0
 		self.server_target_height = None # None = Original
 		self.jpeg_quality = 65
 		self.jpeg_subsampling = "4:2:0"
-		self.rtp_debug = True 		# set False to silence per-packet logs
-		self.developerMode = True  # Enable DeveloperMode FEC testing
+		self.rtp_debug = bool(rtpDebug) 		# set False to silence per-packet logs
+		self.developerMode = bool(developerMode)  # Enable DeveloperMode FEC testing
 		# Small delay before sending FEC parity to mitigate UDP reordering
 		# Parity may arrive earlier than last data fragment on some stacks.
 		# Delay is in milliseconds; keep tiny to minimize added latency.
@@ -228,7 +229,14 @@ class ServerWorker:
 				self.clientInfo['session'] = randint(100000, 999999)
 				
 				# Send RTSP reply
-				self.replyRtsp(self.OK_200, seq)
+				extra = {}
+				vs = self.clientInfo.get('videoStream')
+				if vs is not None and hasattr(vs, "total_frames"):
+					try:
+						extra['X-TotalFrames'] = int(vs.total_frames)
+					except Exception:
+						pass
+				self.replyRtsp(self.OK_200, seq, extra_headers=extra)
 				
 				# Get the RTP/UDP port from Transport header (Transport: RTP/UDP; client_port=XXXX)
 				transport = headers.get('Transport', '')
@@ -297,6 +305,52 @@ class ServerWorker:
 			if self.rtp_debug:
 				print(f"[RTSP Server] RESOLUTION {desired_h or 'Original'} accepted, profile={profile or 'None'}.")
 			self.replyRtsp(self.OK_200, seq)
+
+		elif requestType == self.SEEK:
+			# allow while READY or PLAYING
+			seek_hdr = headers.get("X-Seek", "0")
+			try:
+				frac = float(seek_hdr)
+			except ValueError:
+				frac = 0.0
+			frac = max(0.0, min(1.0, frac))
+
+			vs = self.clientInfo.get('videoStream')
+			if vs is None:
+				if self.rtp_debug:
+					print(f"[RTSP Server] SEEK requested but no VideoStream available.")
+				self.replyRtsp(self.CON_ERR_500, seq)
+				return
+			
+			# Stop current sender thread is running
+			was_playing = (self.state == self.PLAYING)
+			if was_playing and 'event' in self.clientInfo:
+				event = self.clientInfo['event'] if 'event' in self.clientInfo else None
+				if event:
+					event.set()
+				worker = self.clientInfo.get('worker')
+				if worker and worker.is_alive():
+					try:
+						worker.join(timeout=1.0)
+					except Exception:
+						pass
+
+			# Reposition the VideoStream
+			try:
+				if hasattr(vs, "seek_fraction"):
+					vs.seek_fraction(frac)
+					print(f"[RTSP Server] SEEK to fraction {frac} successful.")
+				self.replyRtsp(self.OK_200, seq)
+			except Exception as e:
+				if self.rtp_debug:
+					print(f"[RTSP Server] SEEK to fraction {frac} failed: {e}")
+				self.replyRtsp(self.CON_ERR_500, seq)
+
+			# If was playing, restart sender thread
+			if was_playing:
+				self.clientInfo['event'] = threading.Event()
+				self.clientInfo['worker'] = threading.Thread(target=self.sendRtp, daemon=True)
+				self.clientInfo['worker'].start()
 
 		# Process TEARDOWN request
 		elif requestType == self.TEARDOWN:
@@ -551,14 +605,19 @@ class ServerWorker:
 		rtpPacket.encode(version, padding, extension, cc, seqnum, marker, pt, ssrc, payload)		
 		return rtpPacket.getPacket()
 		
-	def replyRtsp(self, code, seq):
+	def replyRtsp(self, code, seq, extra_headers=None):
 		"""Send RTSP reply to the client."""
+		if extra_headers is None:
+			extra_headers = {}
 		if code == self.OK_200:
-			reply = (
-				f"RTSP/1.0 200 OK\n"
-				f"CSeq: {seq}\n"
-				f"Session: {self.clientInfo['session']}\n\n"  # Blank line terminator per RTSP RFC
-			)
+			lines = [
+				"RTSP/1.0 200 OK",
+				f"CSeq: {seq}",
+				f"Session: {self.clientInfo['session']}",  # Blank line terminator per RTSP RFC
+			]
+			for k, v in extra_headers.items():
+				lines.append(f"{k}: {v}")
+			reply = "\n".join(lines) + "\n\n"
 			try:
 				connSocket = self.clientInfo['rtspSocket'][0]
 				connSocket.send(reply.encode())

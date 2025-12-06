@@ -21,12 +21,161 @@ class VideoStream:
         self._buffer = bytearray()
         # optional: toggle debug prints
         self.debug = False
+        self.total_frames = self._compute_total_frames()   
 
     def close(self):
         try:
             self.file.close()
         except Exception:
             pass
+
+    def seek_fraction(self, fraction):
+        """
+        Seek the MJPEG stream to approximately 'fraction' of its length.
+
+        fraction: float in [0.0, 1.0]
+        Returns:
+            - bytes of the frame at that position, or
+            - None if seek fails/ EOF.
+
+        After this call:
+            - frameNbr() reflects the new position.
+            - subsequent nextFrame() calls continue from this frame.
+        """
+        if not hasattr(self, 'total_frames') or self.total_frames == 0:
+            if self.debug:
+                print("[VideoStream] seek_fraction: total_frames unknown or zero, cannot seek.")
+            return None
+        
+        try:
+            frac = float(fraction)
+        except (TypeError, ValueError):
+            if self.debug:
+                print(f"[VideoStream] seek_fraction: invalid fraction {fraction}")
+            return None
+        
+        if frac < 0.0:
+            frac = 0.0
+        elif frac > 1.0:
+            frac = 1.0
+
+        if self.total_frames == 1:
+            target_idx = 0
+        else:
+            target_idx = int(frac * (self.total_frames - 1))
+
+        if self.debug:
+            print(f"[VideoStream] seek_fraction({fraction}) -> target_idx={target_idx}) "
+                  f"/ total_frames={self.total_frames}")
+            
+        # Reset file + internal state
+        try:
+            self.file.seek(0, os.SEEK_SET)
+        except (OSError, ValueError):
+            # If for some reason seek fails, reopen file
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = open(self.filename, "rb")
+        self.mode = None
+        self._buffer.clear()
+        self.frameNum = 0
+
+        for _ in range(target_idx):
+            frame = self.nextFrame()
+            if frame is None:
+                # Reached EOF before target frame
+                if self.debug:
+                    print(f"[VideoStream] seek_fraction: reached EOF before target frame {target_idx}")
+                return None
+            
+        frame = self.nextFrame()
+        self.frameNum = target_idx + (1 if frame else 0)
+        if frame is None and self.debug:
+            print(f"[VideoStream] seek_fraction: no frame at target index {target_idx}")
+        return frame
+
+    def _compute_total_frames(self):
+        """Scan the file once (with a separate handle) to count frames."""
+        try:
+            with open(self.filename, "rb") as f:
+                header = f.read(5)
+                if not header:
+                    return 0
+                
+                # Try to detect len-mode the same way as nextFrame
+                try:
+                    int(header.strip())
+                    return self._count_len_mode(f, header)
+                except Exception:
+                    return self._count_marker_mode(f, header)
+        except Exception as e:
+            if self.debug:
+                print(f"[VideoStream] _compute_total_frames error: {e}")
+            return 0
+        
+    def _count_len_mode(self, f, first_header):
+        """Count frames in length-prefixed format using the same convention as nextFrame"""
+        count = 0
+        header = first_header
+
+        while header:
+            try:
+                framelength = int(header.strip())  
+            except Exception:
+                break  # malformed length header
+
+            data = f.read(framelength)
+            if len(data) < framelength:
+                break  # EOF before full frame
+            count += 1
+            header = f.read(5)
+        if self.debug:
+            print(f"[VideoStream] _count_len_mode: total_frames={count}")
+        return count
+        
+    def _count_marker_mode(self, f, initial_bytes):
+        """Count frames in marker mode using SOI/EOI markers."""
+        count = 0
+        buf = bytearray(initial_bytes)
+
+        while True:
+            # Ensure we have some data
+            if not buf:
+                chunk = f.read(4096)
+                if not chunk:
+                    break  
+                buf.extend(chunk)
+
+            # Find next SOI
+            soi = buf.find(self.SOI)
+            if soi == -1:
+                # keep trailing 0xFF if present
+                buf[:] = buf[-1:] if (buf and buf[-1] == 0xFF) else bytearray()
+                chunk = f.read(4096)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                continue
+            if soi > 0:
+                del buf[:soi]
+            
+            # Find EOI after SOI
+            eoi = buf.find(self.EOI, 2)
+            if eoi == -1:
+                chunk = f.read(4096)
+                if not chunk:
+                    return count
+                buf.extend(chunk)
+                eoi = buf.find(self.EOI, 2)
+            
+            # Consume this frame
+            count += 1
+            del buf[:eoi + 2]
+        if self.debug:
+            print(f"[VideoStream] _count_marker_mode: total_frames={count}")
+        return count
 
     def _read_more(self, size=4096):
         """Read more bytes into internal buffer (marker mode) or return chunk."""
